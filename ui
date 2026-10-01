@@ -1,0 +1,578 @@
+-- SerpentUI 1.0 | by rayware
+-- Standalone: paste this entire file into a client executor to open the demo.
+-- Library mode (after hosting this file):
+-- local UI = loadstring(game:HttpGet("YOUR_RAW_URL"))({Demo = false})
+-- local Window = UI:CreateWindow({Title = "My menu", Subtitle = "by me", Theme = "Default"})
+-- Window:AddToggle({Name = "My feature", Default = false, Callback = function(value) print(value) end})
+-- Window:AddSlider({Name = "Speed", Min = 0, Max = 100, Default = 50, Step = 1, Callback = print})
+-- Window:AddButton({Name = "Run", Callback = function() print("Clicked") end})
+-- Window:AddInput({Name = "Name", Placeholder = "Type here", Callback = print})
+-- Window:AddLabel({Text = "Ready"})
+-- Window:AddSection({Name = "Tools"})
+-- All Add methods accept Tab = "Main" or "Settings" (default Main).
+-- Toggle/Slider/Input: handle:SetValue(value, silent), handle:GetValue().
+-- Labels: handle:SetText(text). Every handle:Destroy().
+-- Window:SetTheme(name), :SetTitle(text), :SelectTab(name), :SetMinimized(bool),
+-- :Notify(text, seconds), :OnDestroy(callback), :Track(connectionOrCleanupFunction), :Destroy(instant).
+-- Callbacks do not fire on creation. Use SetValue(value) to fire, SetValue(value, true) to stay silent.
+-- Demo contains UI-only examples; it does not change the game.
+-- Native layered glass styling, no fullscreen blur, no assets, no telemetry.
+
+local options = ...
+if type(options) ~= "table" then options = {} end
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local Input = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+assert(player, "SerpentUI must run on the client")
+local env = type(getgenv) == "function" and getgenv() or _G
+local registry = env.SerpentUI_Windows
+if type(registry) ~= "table" then registry = {}; env.SerpentUI_Windows = registry end
+local UI = {Version = "1.0", Themes = {"Default", "Red", "Blue", "Yellow", "Green", "White", "Black"}}
+local rgb = Color3.fromRGB
+local palettes = {
+    Default = {bg = rgb(15, 7, 7), surface = rgb(38, 24, 24), accent = rgb(255, 100, 76), second = rgb(255, 168, 84)},
+    Red = {bg = rgb(17, 5, 9), surface = rgb(42, 22, 28), accent = rgb(255, 103, 130), second = rgb(255, 171, 148)},
+    Blue = {bg = rgb(5, 10, 21), surface = rgb(22, 32, 49), accent = rgb(105, 170, 255), second = rgb(108, 229, 249)},
+    Yellow = {bg = rgb(18, 14, 5), surface = rgb(43, 36, 22), accent = rgb(249, 206, 88), second = rgb(255, 239, 163)},
+    Green = {bg = rgb(5, 16, 11), surface = rgb(20, 40, 29), accent = rgb(99, 222, 155), second = rgb(156, 248, 216)},
+    White = {bg = rgb(233, 238, 244), surface = rgb(251, 253, 255), accent = rgb(75, 92, 115), second = rgb(121, 148, 176), light = true},
+    Black = {bg = rgb(3, 4, 6), surface = rgb(23, 25, 30), accent = rgb(190, 204, 222), second = rgb(241, 246, 255)},
+}
+local function make(class, parent, props)
+    local item = Instance.new(class)
+    for k, v in pairs(props or {}) do item[k] = v end
+    if item:IsA("GuiObject") then item.BorderSizePixel = 0 end
+    item.Parent = parent
+    return item
+end
+local function round(item, radius) return make("UICorner", item, {CornerRadius = UDim.new(0, radius)}) end
+local function outline(item, transparency)
+    return make("UIStroke", item, {Thickness = 1, Color = rgb(224, 232, 245), Transparency = transparency or 0.8, ApplyStrokeMode = Enum.ApplyStrokeMode.Border})
+end
+
+function UI:CreateWindow(config)
+    config = config or {}
+    local id = tostring(config.Id or "SerpentUI")
+    if registry[id] then pcall(function() registry[id]:Destroy(true) end) end
+    local W = {Alive = true, Closing = false, Theme = palettes[config.Theme] and config.Theme or "Default"}
+    registry[id] = W
+    local connections, tweens, bindings, destroyHooks, cleanup, jobs = {}, {}, {}, {}, {}, {}
+    local busy, minimized, loading, activeTab = false, false, true, "Main"
+    local drag, sliding
+    local speed, glass = 1, 0.14
+    local title = tostring(config.Title or "SerpentUI")
+    local palette
+    local function listen(signal, callback)
+        local c = signal:Connect(callback); table.insert(connections, c); return c
+    end
+    local function animate(object, duration, properties, style)
+        if not W.Alive or not object.Parent then return end
+        tweens[object] = tweens[object] or {}
+        -- Per-property channels: color changes cannot cancel a size/position transition.
+        for key, value in pairs(properties) do
+            if tweens[object][key] then tweens[object][key]:Cancel() end
+            local t = TweenService:Create(object, TweenInfo.new(duration / speed, style or Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {[key] = value})
+            tweens[object][key] = t; t:Play()
+        end
+    end
+    local function bind(callback) table.insert(bindings, callback); callback() end
+    local function safe(callback, ...)
+        if not W.Alive or W.Closing or type(callback) ~= "function" then return end
+        local args = table.pack(...)
+        local job
+        job = task.defer(function()
+            if not W.Alive or W.Closing then jobs[job] = nil; return end
+            local ok, err = pcall(callback, table.unpack(args, 1, args.n))
+            jobs[job] = nil
+            if not ok then warn("[SerpentUI callback] " .. tostring(err)); W:Notify("Callback error · see console") end
+        end)
+        jobs[job] = true
+    end
+    local function resolvePalette()
+        palette = palettes[W.Theme]
+        palette.text = palette.light and rgb(24, 29, 38) or rgb(245, 243, 246)
+        palette.muted = palette.light and rgb(87, 98, 114) or rgb(162, 161, 174)
+    end
+    resolvePalette()
+    local gui = make("ScreenGui", player:WaitForChild("PlayerGui"), {Name = "SerpentUI_" .. id, ResetOnSpawn = false, IgnoreGuiInset = false, DisplayOrder = 90, ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
+    local bounds = make("Frame", gui, {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1})
+    local shell = make("CanvasGroup", bounds, {Size = UDim2.fromOffset(460, 390), BackgroundColor3 = palette.bg, BackgroundTransparency = glass, GroupTransparency = 1, ClipsDescendants = true})
+    local shellCorner = round(shell, 20)
+    local scale = make("UIScale", shell, {Scale = 1})
+    local edge = outline(shell, 0.45)
+    local edgeGradient = make("UIGradient", edge, {Rotation = 55})
+    local reflection = make("Frame", shell, {Size = UDim2.fromScale(1, 1), BackgroundColor3 = rgb(255, 255, 255), Active = false})
+    round(reflection, 20)
+    make("UIGradient", reflection, {Rotation = 112, Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.89), NumberSequenceKeypoint.new(0.35, 0.99), NumberSequenceKeypoint.new(0.8, 1), NumberSequenceKeypoint.new(1, 0.96)})})
+    local function glassSurface(item, transparency)
+        item.BackgroundTransparency = transparency or 0.3
+        local stroke = outline(item, 0.83)
+        make("UIGradient", item, {Rotation = 90, Color = ColorSequence.new(rgb(250, 250, 255), rgb(146, 148, 165))})
+        bind(function()
+            if not item.Parent then return end
+            animate(item, 0.28, {BackgroundColor3 = palette.surface})
+            animate(stroke, 0.28, {Color = palette.accent})
+        end)
+        return stroke
+    end
+    local function text(parent, value, size, position, dimensions, muted, bold)
+        local t = make("TextLabel", parent, {BackgroundTransparency = 1, Text = tostring(value), TextSize = size, Position = position, Size = dimensions, TextXAlignment = Enum.TextXAlignment.Left, Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham, TextTruncate = Enum.TextTruncate.AtEnd})
+        bind(function() if t.Parent then animate(t, 0.25, {TextColor3 = muted and palette.muted or palette.text}) end end)
+        return t
+    end
+    local function button(parent, value, position, dimensions)
+        local b = make("TextButton", parent, {Text = value, AutoButtonColor = false, BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 13, Position = position, Size = dimensions})
+        bind(function() if b.Parent then animate(b, 0.25, {TextColor3 = palette.text}) end end)
+        return b
+    end
+    local full = make("CanvasGroup", shell, {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1})
+    local header = make("Frame", full, {Size = UDim2.new(1, -102, 0, 76), BackgroundTransparency = 1, Active = true})
+    local titleLabel = text(header, title, 23, UDim2.fromOffset(20, 16), UDim2.new(1, -24, 0, 29), false, true)
+    text(header, config.Subtitle or "by rayware", 11, UDim2.fromOffset(21, 47), UDim2.new(1, -24, 0, 16), true)
+    local minimize = button(full, "", UDim2.new(1, -94, 0, 17), UDim2.fromOffset(40, 40))
+    local close = button(full, "", UDim2.new(1, -49, 0, 17), UDim2.fromOffset(40, 40))
+    for _, b in ipairs({minimize, close}) do
+        round(b, 11)
+        local bars = b == minimize and {0} or {45, -45}
+        for _, angle in ipairs(bars) do
+            local bar = make("Frame", b, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(13, 2), Rotation = angle})
+            round(bar, 1)
+            bind(function() animate(bar, 0.25, {BackgroundColor3 = palette.muted}) end)
+        end
+        listen(b.MouseEnter, function() animate(b, 0.15, {BackgroundColor3 = palette.surface, BackgroundTransparency = 0.2}) end)
+        listen(b.MouseLeave, function() animate(b, 0.2, {BackgroundTransparency = 1}) end)
+    end
+    -- Compact vertical navigation stays readable on touch screens.
+    local tabs = make("Frame", full, {Position = UDim2.fromOffset(14, 82), Size = UDim2.new(0, 68, 1, -122)})
+    round(tabs, 16); glassSurface(tabs, 0.4)
+    local indicator = make("Frame", tabs, {Position = UDim2.fromOffset(4, 4), Size = UDim2.fromOffset(60, 70), BackgroundTransparency = 0.82})
+    round(indicator, 12); local selectedEdge = outline(indicator, 0.68)
+    local accentRail = make("Frame", indicator, {Position = UDim2.fromOffset(0, 23), Size = UDim2.fromOffset(2, 24)})
+    round(accentRail, 1)
+    local tabButtons, tabLabels, navIcons, navScales, pages = {}, {}, {}, {}, {}
+    local function paintNavigation()
+        for name, label in pairs(tabLabels) do
+            animate(label, 0.2, {TextColor3 = name == activeTab and palette.text or palette.muted})
+            animate(navScales[name], 0.35, {Scale = name == activeTab and 1.06 or 0.94}, Enum.EasingStyle.Back)
+            for _, part in ipairs(navIcons[name]:GetChildren()) do
+                if part:IsA("Frame") then
+                    animate(part, 0.25, {BackgroundColor3 = palette.accent, BackgroundTransparency = name == activeTab and 0 or 0.32})
+                end
+            end
+        end
+        animate(accentRail, 0.25, {BackgroundColor3 = palette.second})
+        animate(selectedEdge, 0.25, {Color = palette.accent})
+    end
+    for i, name in ipairs({"Main", "Settings"}) do
+        local b = button(tabs, "", UDim2.fromOffset(4, 4 + (i - 1) * 78), UDim2.fromOffset(60, 70))
+        tabButtons[name] = b
+        round(b, 12)
+        local icon = make("Frame", b, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0, 25), Size = UDim2.fromOffset(22, 22), BackgroundTransparency = 1})
+        navIcons[name] = icon
+        navScales[name] = make("UIScale", icon, {Scale = 1})
+        if name == "Main" then
+            for x = 0, 1 do for y = 0, 1 do
+                local tile = make("Frame", icon, {Position = UDim2.fromOffset(x * 13, y * 13), Size = UDim2.fromOffset(9, 9)})
+                round(tile, 3)
+            end end
+        else
+            -- Three adjustment sliders, drawn locally: no asset loading.
+            for index = 0, 2 do
+                local line = make("Frame", icon, {Position = UDim2.fromOffset(1, 3 + index * 8), Size = UDim2.fromOffset(20, 2)})
+                round(line, 1)
+                local dot = make("Frame", icon, {Position = UDim2.fromOffset(index == 1 and 13 or 4, index * 8), Size = UDim2.fromOffset(6, 8)})
+                round(dot, 3)
+            end
+        end
+        local label = text(b, name, 10, UDim2.fromOffset(2, 44), UDim2.new(1, -4, 0, 18), true, true)
+        label.TextXAlignment = Enum.TextXAlignment.Center
+        tabLabels[name] = label
+        listen(b.MouseEnter, function()
+            if W.Closing or busy then return end
+            animate(b, 0.16, {BackgroundColor3 = palette.accent, BackgroundTransparency = 0.92})
+            animate(navScales[name], 0.3, {Scale = 1.12}, Enum.EasingStyle.Back)
+        end)
+        listen(b.MouseLeave, function()
+            animate(b, 0.2, {BackgroundTransparency = 1})
+            animate(navScales[name], 0.3, {Scale = name == activeTab and 1.06 or 0.94}, Enum.EasingStyle.Back)
+        end)
+        listen(b.InputBegan, function(input)
+            if W.Closing or busy or loading then return end
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                animate(navScales[name], 0.1, {Scale = 0.85})
+            end
+        end)
+        listen(Input.InputEnded, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                animate(navScales[name], 0.35, {Scale = name == activeTab and 1.06 or 0.94}, Enum.EasingStyle.Back)
+            end
+        end)
+        local group = make("CanvasGroup", full, {Position = UDim2.fromOffset(96, 82), Size = UDim2.new(1, -112, 1, -122), BackgroundTransparency = 1, Visible = name == "Main", GroupTransparency = name == "Main" and 0 or 1})
+        local scroll = make("ScrollingFrame", group, {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 2, ScrollingDirection = Enum.ScrollingDirection.Y, ClipsDescendants = true})
+        make("UIPadding", scroll, {PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 6), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 8)})
+        make("UIListLayout", scroll, {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder})
+        pages[name] = {group = group, scroll = scroll, count = 0}
+        bind(function() animate(scroll, 0.2, {ScrollBarImageColor3 = palette.accent}) end)
+    end
+    local footer = text(full, "Ready", 10, UDim2.new(0, 20, 1, -28), UDim2.new(1, -40, 0, 16), true)
+    local compact = make("Frame", shell, {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false, Active = true})
+    local inset = make("Frame", compact, {Position = UDim2.fromOffset(3, 3), Size = UDim2.new(1, -6, 1, -6)})
+    round(inset, 23); glassSurface(inset, 0.7)
+    local compactTitle = text(compact, title, 15, UDim2.fromOffset(14, 0), UDim2.new(1, -28, 1, -3), false, true)
+    compactTitle.TextXAlignment = Enum.TextXAlignment.Center
+    local handle = make("Frame", compact, {AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -6), Size = UDim2.fromOffset(40, 2), BackgroundTransparency = 0.3})
+    round(handle, 2)
+    local sheen = make("Frame", shell, {Position = UDim2.fromScale(-0.6, 0), Size = UDim2.fromScale(0.5, 1), BackgroundColor3 = rgb(255, 255, 255), ZIndex = 6, Active = false})
+    make("UIGradient", sheen, {Rotation = 18, Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.45, 0.99), NumberSequenceKeypoint.new(0.5, 0.91), NumberSequenceKeypoint.new(0.55, 0.99), NumberSequenceKeypoint.new(1, 1)})})
+    local function shine()
+        if not W.Alive or W.Closing then return end
+        if tweens[sheen] and tweens[sheen].Position then tweens[sheen].Position:Cancel() end
+        sheen.Position = UDim2.fromScale(-0.6, 0)
+        animate(sheen, 0.8, {Position = UDim2.fromScale(1.2, 0)})
+    end
+    bind(function()
+        animate(shell, 0.3, {BackgroundColor3 = palette.bg})
+        animate(reflection, 0.3, {BackgroundColor3 = palette.accent:Lerp(rgb(255, 255, 255), 0.7)})
+        animate(handle, 0.3, {BackgroundColor3 = palette.accent})
+        animate(indicator, 0.3, {BackgroundColor3 = palette.accent})
+        edgeGradient.Color = ColorSequence.new(palette.second, palette.accent)
+        paintNavigation()
+    end)
+    local function dimensions(mini)
+        local area = bounds.AbsoluteSize
+        if mini then return Vector2.new(166, 50) end
+        return Vector2.new(math.min(config.Width or 460, math.max(230, area.X - 30)), math.min(config.Height or 390, math.max(290, area.Y - 32)))
+    end
+    local function clampPosition(position, size)
+        local area = bounds.AbsoluteSize
+        return Vector2.new(math.clamp(position.X, 8, math.max(8, area.X - size.X - 8)), math.clamp(position.Y, 8, math.max(8, area.Y - size.Y - 8)))
+    end
+    local function fit(center)
+        if not W.Alive or busy or W.Closing then return end
+        local size = dimensions(minimized)
+        local position = center and (bounds.AbsoluteSize - size) / 2 or Vector2.new(shell.Position.X.Offset, shell.Position.Y.Offset)
+        position = clampPosition(position, size)
+        shell.Size = UDim2.fromOffset(size.X, size.Y); shell.Position = UDim2.fromOffset(position.X, position.Y)
+    end
+    fit(true); listen(bounds:GetPropertyChangedSignal("AbsoluteSize"), function() fit(false) end)
+    local function pop(amount)
+        scale.Scale = amount
+        animate(scale, 0.46, {Scale = 1}, Enum.EasingStyle.Back)
+    end
+    local notifyToken = 0
+    function W:Notify(message, seconds)
+        if not self.Alive or self.Closing then return end
+        notifyToken = notifyToken + 1
+        local token = notifyToken
+        footer.Text = tostring(message)
+        task.delay(seconds or 3, function() if self.Alive and not self.Closing and token == notifyToken then footer.Text = "Ready" end end)
+    end
+    function W:SetTitle(value)
+        if not self.Alive or self.Closing then return end
+        title = tostring(value); titleLabel.Text = title; compactTitle.Text = title
+    end
+    function W:SetTheme(name)
+        assert(palettes[name], "Unknown SerpentUI theme: " .. tostring(name))
+        if not self.Alive or self.Closing then return end
+        self.Theme = name; resolvePalette()
+        for _, callback in ipairs(bindings) do callback() end
+        shine()
+    end
+    function W:SelectTab(name)
+        assert(pages[name], "Use Main or Settings")
+        if not self.Alive or self.Closing or busy or loading or minimized or activeTab == name then return end
+        if sliding then sliding.scroll.ScrollingEnabled = true end
+        busy, drag, sliding = true, nil, nil
+        local old = pages[activeTab].group; activeTab = name
+        animate(indicator, 0.42, {Position = UDim2.fromOffset(4, name == "Main" and 4 or 82)}, Enum.EasingStyle.Back)
+        paintNavigation()
+        animate(old, 0.1, {GroupTransparency = 1}); task.wait(0.1 / speed)
+        if not self.Alive or self.Closing then return end
+        old.Visible = false
+        local new = pages[name].group; new.Visible = true; new.Position = UDim2.fromOffset(102, 82)
+        animate(new, 0.22, {GroupTransparency = 0, Position = UDim2.fromOffset(96, 82)})
+        task.wait(0.25 / speed)
+        if not self.Alive or self.Closing then return end
+        busy = false; fit(false)
+    end
+    for name, b in pairs(tabButtons) do listen(b.Activated, function() W:SelectTab(name) end) end
+    function W:SetMinimized(value)
+        value = not not value
+        if not self.Alive or self.Closing or busy or loading or value == minimized then return end
+        if sliding then sliding.scroll.ScrollingEnabled = true end
+        busy, drag, sliding = true, nil, nil
+        animate(full, 0.12, {GroupTransparency = 1}); task.wait(0.12 / speed)
+        if not self.Alive or self.Closing then return end
+        full.Visible, compact.Visible = false, false; minimized = value
+        local size = dimensions(value)
+        local position = clampPosition(Vector2.new(shell.Position.X.Offset, shell.Position.Y.Offset), size)
+        animate(shellCorner, 0.3, {CornerRadius = UDim.new(0, value and 25 or 20)})
+        animate(shell, 0.3, {Size = UDim2.fromOffset(size.X, size.Y), Position = UDim2.fromOffset(position.X, position.Y)})
+        task.wait(0.3 / speed)
+        if not self.Alive or self.Closing then return end
+        compact.Visible, full.Visible = value, not value
+        if not value then animate(full, 0.18, {GroupTransparency = 0}) end
+        pop(0.95); shine(); task.wait(0.48 / speed)
+        if not self.Alive or self.Closing then return end
+        busy = false; fit(false)
+    end
+    listen(minimize.Activated, function() W:SetMinimized(true) end)
+    local function startDrag(surface, reopen)
+        listen(surface.InputBegan, function(input)
+            if busy or loading or W.Closing or drag then return end
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            if tweens[scale] and tweens[scale].Scale then tweens[scale].Scale:Cancel() end
+            scale.Scale = 1
+            drag = {input = input, origin = Vector2.new(shell.Position.X.Offset, shell.Position.Y.Offset), start = Vector2.new(input.Position.X, input.Position.Y), moved = false, reopen = reopen}
+        end)
+    end
+    startDrag(header, false); startDrag(compact, true)
+    listen(Input.InputChanged, function(input)
+        if W.Closing then return end
+        if sliding then
+            local touch = sliding.input.UserInputType == Enum.UserInputType.Touch
+            if (touch and input == sliding.input) or (not touch and input.UserInputType == Enum.UserInputType.MouseMovement) then sliding.update(input.Position.X) end
+        end
+        if not drag then return end
+        local touch = drag.input.UserInputType == Enum.UserInputType.Touch
+        if (touch and input ~= drag.input) or (not touch and input.UserInputType ~= Enum.UserInputType.MouseMovement) then return end
+        local delta = Vector2.new(input.Position.X, input.Position.Y) - drag.start
+        if delta.Magnitude > 7 then drag.moved = true end
+        if drag.moved then local pos = clampPosition(drag.origin + delta, shell.AbsoluteSize); shell.Position = UDim2.fromOffset(pos.X, pos.Y) end
+    end)
+    local function matches(input, original) return input == original or (original.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1) end
+    listen(Input.InputEnded, function(input)
+        if sliding and matches(input, sliding.input) then sliding.scroll.ScrollingEnabled = true; sliding = nil end
+        if drag and matches(input, drag.input) then local reopen = drag.reopen and not drag.moved; drag = nil; if reopen then W:SetMinimized(false) end end
+    end)
+    listen(Input.WindowFocusReleased, function()
+        drag = nil
+        if sliding then sliding.scroll.ScrollingEnabled = true; sliding = nil end
+    end)
+
+    local function newRow(args, height)
+        assert(W.Alive and not W.Closing, "Window is destroyed")
+        local page = pages[args.Tab or "Main"]; assert(page, "Use Main or Settings")
+        page.count = page.count + 1
+        local row = make("Frame", page.scroll, {Size = UDim2.new(1, 0, 0, height), LayoutOrder = page.count, ClipsDescendants = true})
+        round(row, 12); glassSurface(row, 0.27)
+        local handle = {Alive = true, Instance = row}
+        function handle:Destroy()
+            if not self.Alive then return end
+            self.Alive = false
+            if sliding and sliding.owner == self then sliding.scroll.ScrollingEnabled = true; sliding = nil end
+            row:Destroy()
+        end
+        return row, handle, page.scroll
+    end
+    local function usable(handle) return handle.Alive and W.Alive and not W.Closing end
+    function W:AddLabel(args)
+        if type(args) == "string" then args = {Text = args} end
+        local row, h = newRow(args, args.Height or 46)
+        local t = text(row, args.Text or "Label", 12, UDim2.fromOffset(13, 6), UDim2.new(1, -26, 1, -12), true)
+        t.TextWrapped = true; t.TextTruncate = Enum.TextTruncate.None
+        function h:SetText(value) if usable(self) then t.Text = tostring(value) end end
+        return h
+    end
+    function W:AddSection(args)
+        local row, h = newRow(args, 28); row.BackgroundTransparency = 1
+        local stroke = row:FindFirstChildOfClass("UIStroke"); if stroke then stroke.Enabled = false end
+        text(row, args.Name or "Section", 11, UDim2.fromOffset(3, 0), UDim2.new(1, -6, 1, 0), true, true)
+        return h
+    end
+    function W:AddButton(args)
+        local row, h = newRow(args, 48)
+        text(row, args.Name or "Button", 13, UDim2.fromOffset(13, 0), UDim2.new(1, -50, 1, 0))
+        text(row, "+", 20, UDim2.new(1, -35, 0, 0), UDim2.fromOffset(24, 48), true)
+        local b = button(row, "", UDim2.new(), UDim2.fromScale(1, 1))
+        listen(b.Activated, function()
+            if not usable(h) or loading then return end
+            animate(row, 0.1, {BackgroundTransparency = 0.05})
+            task.delay(0.12, function() if usable(h) then animate(row, 0.3, {BackgroundTransparency = 0.27}) end end)
+            safe(args.Callback)
+        end)
+        return h
+    end
+    function W:AddToggle(args)
+        local row, h = newRow(args, 56)
+        text(row, args.Name or "Toggle", 13, UDim2.fromOffset(13, 0), UDim2.new(1, -91, 1, 0))
+        local track = make("Frame", row, {Position = UDim2.new(1, -65, 0, 14), Size = UDim2.fromOffset(48, 28)})
+        round(track, 14); outline(track, 0.7)
+        local knob = make("Frame", track, {Position = UDim2.fromOffset(4, 4), Size = UDim2.fromOffset(20, 20)})
+        round(knob, 10)
+        make("UIGradient", knob, {Rotation = 90, Color = ColorSequence.new(rgb(255, 255, 255), rgb(182, 191, 207))})
+        local value = not not args.Default
+        local function paint()
+            if not usable(h) then return end
+            animate(track, 0.2, {BackgroundColor3 = value and palette.accent or (palette.light and rgb(171, 181, 195) or rgb(48, 48, 57))})
+            animate(knob, 0.4, {Position = UDim2.fromOffset(value and 24 or 4, 4), BackgroundColor3 = rgb(255, 255, 255)}, Enum.EasingStyle.Back)
+        end
+        bind(paint)
+        function h:SetValue(nextValue, silent)
+            if not usable(self) then return end
+            nextValue = not not nextValue
+            if value == nextValue then return end
+            value = nextValue; paint(); if not silent then safe(args.Callback, value) end
+        end
+        function h:GetValue() return value end
+        local b = button(row, "", UDim2.new(1, -80, 0, 0), UDim2.fromOffset(80, 56))
+        listen(b.Activated, function() if not loading then h:SetValue(not value) end end)
+        return h
+    end
+    function W:AddSlider(args)
+        local minimum, maximum, step = args.Min or 0, args.Max or 100, args.Step or 1
+        assert(maximum > minimum and step > 0, "Slider requires Max > Min and Step > 0")
+        local row, h, scroll = newRow(args, 76)
+        text(row, args.Name or "Slider", 13, UDim2.fromOffset(13, 6), UDim2.new(1, -92, 0, 25))
+        local number = text(row, "", 12, UDim2.new(1, -77, 0, 6), UDim2.fromOffset(64, 25), true)
+        number.TextXAlignment = Enum.TextXAlignment.Right
+        local hit = button(row, "", UDim2.fromOffset(14, 31), UDim2.new(1, -28, 0, 40))
+        local rail = make("Frame", hit, {Position = UDim2.new(0, 0, 0.5, -2), Size = UDim2.new(1, 0, 0, 4), BackgroundColor3 = rgb(83, 84, 96), BackgroundTransparency = 0.5})
+        round(rail, 2)
+        local fill = make("Frame", rail, {Size = UDim2.fromScale(0, 1)}); round(fill, 2)
+        local knob = make("Frame", hit, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.fromOffset(14, 14)})
+        round(knob, 7); outline(knob, 0.65)
+        bind(function() if usable(h) then animate(fill, 0.2, {BackgroundColor3 = palette.accent}); animate(knob, 0.2, {BackgroundColor3 = palette.second}) end end)
+        local value
+        function h:SetValue(nextValue, silent)
+            if not usable(self) then return end
+            assert(type(nextValue) == "number" and nextValue == nextValue, "Slider value must be a number")
+            nextValue = math.clamp(minimum + math.floor((nextValue - minimum) / step + 0.5) * step, minimum, maximum)
+            nextValue = math.floor(nextValue * 100000 + 0.5) / 100000
+            if value == nextValue then return end
+            value = nextValue; number.Text = tostring(value)
+            local alpha = (value - minimum) / (maximum - minimum)
+            animate(fill, 0.08, {Size = UDim2.fromScale(alpha, 1)})
+            animate(knob, 0.08, {Position = UDim2.fromScale(alpha, 0.5)})
+            if not silent then safe(args.Callback, value) end
+        end
+        function h:GetValue() return value end
+        h:SetValue(args.Default or minimum, true)
+        listen(hit.InputBegan, function(input)
+            if not usable(h) or loading or busy or sliding then return end
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            local function update(x)
+                if not usable(h) then return end
+                local alpha = math.clamp((x - hit.AbsolutePosition.X) / math.max(1, hit.AbsoluteSize.X), 0, 1)
+                h:SetValue(minimum + alpha * (maximum - minimum))
+            end
+            sliding = {input = input, update = update, owner = h, scroll = scroll}; scroll.ScrollingEnabled = false; update(input.Position.X)
+        end)
+        return h
+    end
+    function W:AddInput(args)
+        local row, h = newRow(args, 82)
+        text(row, args.Name or "Input", 12, UDim2.fromOffset(13, 6), UDim2.new(1, -26, 0, 23), true)
+        local box = make("TextBox", row, {Position = UDim2.fromOffset(12, 34), Size = UDim2.new(1, -24, 0, 35), BackgroundTransparency = 0.6, Text = tostring(args.Default or ""), PlaceholderText = args.Placeholder or "Type here", ClearTextOnFocus = false, Font = Enum.Font.Gotham, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left})
+        round(box, 8); outline(box, 0.85)
+        make("UIPadding", box, {PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10)})
+        bind(function() if usable(h) then animate(box, 0.2, {BackgroundColor3 = palette.bg, TextColor3 = palette.text, PlaceholderColor3 = palette.muted}) end end)
+        local value = box.Text
+        function h:SetValue(nextValue, silent)
+            if not usable(self) then return end
+            value = tostring(nextValue); box.Text = value
+            if not silent then safe(args.Callback, value) end
+        end
+        function h:GetValue() return value end
+        listen(box.FocusLost, function(enterPressed) if usable(h) then value = box.Text; safe(args.Callback, value, enterPressed) end end)
+        return h
+    end
+
+    function W:Track(resource) table.insert(cleanup, resource); return resource end
+    function W:OnDestroy(callback) assert(type(callback) == "function"); table.insert(destroyHooks, callback); return self end
+    local function dispose()
+        if not W.Alive then return end
+        W.Alive = false
+        for _, c in ipairs(connections) do c:Disconnect() end
+        for _, group in pairs(tweens) do for _, t in pairs(group) do t:Cancel() end end
+        local current = coroutine.running()
+        for job in pairs(jobs) do if job ~= current then pcall(task.cancel, job) end end
+        for _, resource in ipairs(cleanup) do
+            pcall(function() if type(resource) == "function" then resource() else resource:Disconnect() end end)
+        end
+        for _, callback in ipairs(destroyHooks) do local ok, err = pcall(callback); if not ok then warn("[SerpentUI cleanup] " .. tostring(err)) end end
+        if registry[id] == W then registry[id] = nil end
+        gui:Destroy()
+    end
+    function W:Destroy(instant)
+        if not self.Alive then return end
+        if instant then self.Closing = true; dispose(); return end
+        if self.Closing then return end
+        self.Closing, drag, sliding = true, nil, nil
+        animate(scale, 0.22, {Scale = 0.91}, Enum.EasingStyle.Back)
+        animate(shell, 0.22, {GroupTransparency = 1, Position = shell.Position + UDim2.fromOffset(0, 10)})
+        task.wait(0.23 / speed); dispose()
+    end
+    listen(close.Activated, function() W:Destroy() end)
+    listen(gui.Destroying, function() if W.Alive then W.Closing = true; dispose() end end)
+
+    W:AddSection({Name = "Appearance", Tab = "Settings"})
+    local themeRow = make("Frame", pages.Settings.scroll, {Size = UDim2.new(1, 0, 0, 176), BackgroundTransparency = 1, LayoutOrder = 2})
+    pages.Settings.count = 2
+    for i, name in ipairs(UI.Themes) do
+        local column, rowIndex = (i - 1) % 2, math.floor((i - 1) / 2)
+        local b = button(themeRow, name, UDim2.new(column / 2, column == 0 and 0 or 4, 0, rowIndex * 44), UDim2.new(0.5, -4, 0, 38))
+        round(b, 10); local border = glassSurface(b, 0.25)
+        local swatch = make("Frame", b, {Position = UDim2.fromOffset(10, 13), Size = UDim2.fromOffset(12, 12), BackgroundColor3 = name == "White" and rgb(255, 255, 255) or name == "Black" and rgb(7, 8, 10) or palettes[name].accent})
+        round(swatch, 6); outline(swatch, 0.6)
+        bind(function() animate(border, 0.25, {Transparency = W.Theme == name and 0.08 or 0.8, Thickness = W.Theme == name and 1.5 or 1}) end)
+        listen(b.Activated, function() if not loading and not busy then W:SetTheme(name) end end)
+    end
+    W:AddSlider({Name = "Glass", Tab = "Settings", Min = 0, Max = 35, Default = 14, Callback = function(value)
+        glass = value / 100; animate(shell, 0.2, {BackgroundTransparency = glass})
+    end})
+    W:AddSlider({Name = "Animation speed", Tab = "Settings", Min = 0.6, Max = 1.6, Step = 0.1, Default = 1, Callback = function(value) speed = value end})
+    W:AddLabel({Text = "SerpentUI · by rayware", Tab = "Settings"})
+
+    -- Intro stays inside the window. It never waits for a remote asset or a game module.
+    local loader = make("CanvasGroup", shell, {Size = UDim2.fromScale(1, 1), BackgroundColor3 = palette.bg, ZIndex = 10, Active = true})
+    round(loader, 20)
+    local introTitle = text(loader, title, 29, UDim2.new(0, 20, 0.5, -47), UDim2.new(1, -40, 0, 40), false, true)
+    introTitle.TextXAlignment = Enum.TextXAlignment.Center
+    local introSub = text(loader, config.Subtitle or "by rayware", 11, UDim2.new(0, 0, 0.5, -3), UDim2.new(1, 0, 0, 20), true)
+    introSub.TextXAlignment = Enum.TextXAlignment.Center
+    local rail = make("Frame", loader, {Position = UDim2.new(0.2, 0, 0.5, 40), Size = UDim2.new(0.6, 0, 0, 4), BackgroundColor3 = palette.surface, ClipsDescendants = true})
+    round(rail, 2)
+    local progress = make("Frame", rail, {Size = UDim2.fromScale(0, 1), BackgroundColor3 = rgb(255, 255, 255)})
+    round(progress, 2); make("UIGradient", progress, {Color = ColorSequence.new(palette.accent, palette.second)})
+    local bars = {}
+    for i = 1, 5 do
+        local bar = make("Frame", loader, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, (i - 3) * 9, 0.5, -74), Size = UDim2.fromOffset(3, 8), BackgroundColor3 = palette.accent:Lerp(palette.second, (i - 1) / 4)})
+        round(bar, 2); bars[i] = bar
+    end
+    task.defer(function()
+        if not W.Alive then return end
+        pop(0.9); animate(shell, 0.3, {GroupTransparency = 0})
+        animate(progress, 1.4, {Size = UDim2.fromScale(1, 1)})
+        for beat = 1, 8 do
+            if not W.Alive or W.Closing then return end
+            for i, bar in ipairs(bars) do animate(bar, 0.18, {Size = UDim2.fromOffset(3, 8 + 16 * math.abs(math.sin(beat * 0.85 + i * 0.7)))}, Enum.EasingStyle.Sine) end
+            task.wait(0.18 / speed)
+        end
+        if not W.Alive or W.Closing then return end
+        animate(loader, 0.28, {GroupTransparency = 1}); task.wait(0.3 / speed)
+        if not W.Alive or W.Closing then return end
+        loader.Visible = false; loading = false; pop(0.97); shine()
+    end)
+    return W
+end
+
+if options.Demo ~= false then
+    local window = UI:CreateWindow({Id = "SerpentUI_Demo", Title = "SerpentUI", Subtitle = "by rayware", Theme = "Default"})
+    UI.DemoWindow = window
+    window:AddSection({Name = "Playground"})
+    local status = window:AddLabel({Text = "Try the controls. Make this menu yours."})
+    window:AddToggle({Name = "Test toggle", Default = false, Callback = function(value)
+        status:SetText(value and "Test toggle is on" or "Test toggle is off")
+        window:Notify(value and "Enabled" or "Disabled")
+    end})
+    window:AddSlider({Name = "Test value", Min = 0, Max = 100, Default = 35, Callback = function(value)
+        status:SetText("Slider value: " .. value)
+    end})
+    window:AddButton({Name = "Test notification", Callback = function() window:Notify("Hello from SerpentUI", 3) end})
+    window:AddInput({Name = "Window title", Default = "SerpentUI", Placeholder = "Your menu name", Callback = function(value)
+        if value:match("%S") then window:SetTitle(value) end
+    end})
+end
+return UI
